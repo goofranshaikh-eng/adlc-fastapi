@@ -110,7 +110,12 @@ async def _forward_events(
     agent_client: AgentClient,
     registry: RunRegistry,
 ) -> AsyncIterator[str]:
-    """Yield agent SSE frames unchanged. Always remove the run mapping."""
+    """Yield agent SSE frames until the first terminal event.
+
+    Exactly one of ``completed`` or ``failed`` is forwarded. The stream then
+    closes, so a malformed agent stream cannot deliver both. The ``finally``
+    block drops the local run mapping and does not cancel the agent run.
+    """
     try:
         async for agent_event in agent_client.subscribe_to_run(agent_run_id):
             event_type = agent_event["event"]
@@ -125,6 +130,7 @@ async def _forward_events(
         logger.exception("agent subscription failed")
         yield _sse_frame("failed", {"run_id": run_id, "error": STREAM_ERROR})
     finally:
+        # Local id mapping only. The agent's background job continues.
         try:
             registry.remove(run_id)
         except KeyError:

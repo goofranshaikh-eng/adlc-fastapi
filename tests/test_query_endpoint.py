@@ -1,11 +1,13 @@
 """POST /query immediate reply, registration, and agent failure mapping."""
 
+import asyncio
 import logging
 import time
 import uuid
 from collections.abc import Iterator
 from unittest.mock import AsyncMock, MagicMock
 
+import httpx
 import pytest
 from fastapi.testclient import TestClient
 
@@ -79,6 +81,53 @@ def test_successful_query_returns_ok_immediately(
     )
 
 
+def test_concurrent_queries_return_within_100ms(
+    agent_client: AsyncMock,
+    registry: MagicMock,
+) -> None:
+    """AC1: 12 in-flight POSTs each return the agent reply in under 100ms."""
+    agent_client.initiate_query.return_value = {
+        "status": "ok",
+        "agent_run_id": "agent-123",
+    }
+    app.dependency_overrides[get_agent_client] = lambda: agent_client
+    app.dependency_overrides[get_run_registry] = lambda: registry
+
+    async def scenario() -> tuple[list[tuple[httpx.Response, float]], float]:
+        transport = httpx.ASGITransport(app=app)
+
+        async def one(index: int) -> tuple[httpx.Response, float]:
+            started = time.perf_counter()
+            response = await http.post("/query", json={"query": f"test query {index}"})
+            return response, time.perf_counter() - started
+
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as http:
+            started = time.perf_counter()
+            results = await asyncio.gather(*(one(index) for index in range(12)))
+            return list(results), time.perf_counter() - started
+
+    try:
+        results, elapsed = asyncio.run(scenario())
+    finally:
+        app.dependency_overrides.clear()
+
+    assert elapsed < 0.1
+    assert len(results) == 12
+    run_ids = set()
+    for response, request_elapsed in results:
+        assert response.status_code == 200
+        body = response.json()
+        assert body["status"] == "ok"
+        assert set(body) == {"status", "run_id"}
+        _assert_uuid4(body["run_id"])
+        run_ids.add(body["run_id"])
+        assert request_elapsed < 0.1
+    assert len(run_ids) == 12
+    assert agent_client.initiate_query.await_count == 12
+    agent_client.subscribe_to_run.assert_not_called()
+    assert registry.register.call_count == 12
+
+
 def test_rejected_query_returns_200_and_registers_run(
     client: TestClient,
     agent_client: AsyncMock,
@@ -119,8 +168,11 @@ def test_agent_unavailable_returns_503_without_registering(
     agent_client.initiate_query.side_effect = error
     caplog.set_level(logging.ERROR)
 
+    started = time.perf_counter()
     response = client.post("/query", json={"query": "test query"})
+    elapsed = time.perf_counter() - started
 
+    assert elapsed < 0.1
     assert response.status_code == 503
     assert response.json() == {"detail": "Agent service unavailable"}
     assert str(error) not in response.text

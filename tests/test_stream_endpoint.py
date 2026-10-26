@@ -168,6 +168,41 @@ def test_stream_closes_after_failed_event(
     registry.remove.assert_called_once_with(RUN_ID)
 
 
+def test_stream_stops_after_first_terminal_event_even_if_agent_sends_more(
+    client: tuple[TestClient, ScriptedAgent],
+    registry: MagicMock,
+) -> None:
+    """AD-4: the first terminal event closes the stream, so both are never sent."""
+    test_client, agent = client
+    cases = (
+        (
+            [IN_PROGRESS, COMPLETED, FAILED, UNEXPECTED],
+            [IN_PROGRESS, COMPLETED],
+            ["in_progress", "completed"],
+        ),
+        (
+            [IN_PROGRESS, FAILED, COMPLETED, UNEXPECTED],
+            [IN_PROGRESS, FAILED],
+            ["in_progress", "failed"],
+        ),
+    )
+    for events, expected, produced in cases:
+        agent.produced.clear()
+        agent.subscribed.clear()
+        registry.remove.reset_mock()
+        response, _elapsed = _open(test_client, agent, events)
+
+        parsed = parse_sse(response.text)
+        assert parsed == expected
+        terminals = [
+            event["event"] for event in parsed if event["event"] in {"completed", "failed"}
+        ]
+        assert terminals == [expected[-1]["event"]]
+        assert agent.produced == produced
+        assert agent.subscribed == [AGENT_RUN_ID]
+        registry.remove.assert_called_once_with(RUN_ID)
+
+
 def test_missing_run_returns_404_without_subscribing(
     client: tuple[TestClient, ScriptedAgent],
     registry: MagicMock,
@@ -188,6 +223,13 @@ def test_subscription_timeout_sends_failed_event(
     registry: MagicMock,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
+    """Timeout emits a backend-generated ``failed`` event, not an agent event.
+
+    AC3 still holds on the normal path: agent status is forwarded and not
+    invented. When the subscription times out, this process itself creates
+    ``failed`` with "Agent timeout". That exception is the HLD Risk 3
+    mitigation, distinct from a ``failed`` event the agent already sent.
+    """
     test_client, agent = client
     caplog.set_level("ERROR")
     response, elapsed = _open(
@@ -231,6 +273,10 @@ def test_subscription_error_sends_generic_failed_event(
 
 
 def test_client_disconnection_triggers_cleanup(registry: MagicMock) -> None:
+    """Disconnect cancels the local subscription and drops the registry entry.
+
+    The agent run is not cancelled; its background job continues.
+    """
     asyncio.run(_assert_disconnect_cleans_up(registry))
 
 

@@ -51,6 +51,11 @@ data: {"run_id": "run-123"}
 
 """
 
+IN_PROGRESS_ONLY = """event: in_progress
+data: {"run_id": "run-123"}
+
+"""
+
 
 class TrackingTransport(httpx.MockTransport):
     """Mock transport that records requests and whether the client closed it."""
@@ -267,6 +272,35 @@ def test_single_connection_per_subscription() -> None:
     events = asyncio.run(scenario())
     assert [event["event"] for event in events] == ["in_progress", "completed"]
     assert len(transport.requests) == 1
+    assert transport.closed is True
+
+
+def test_disconnect_during_in_progress_is_error_without_retry() -> None:
+    """A drop before a terminal event is an error and opens no second request.
+
+    HLD Risk 3: disconnection while the stream is still ``in_progress`` is
+    not a silent end and is not retried.
+    """
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, text=IN_PROGRESS_ONLY)
+
+    transport = _transport(handler)
+
+    async def scenario() -> list[dict]:
+        client = AgentClient(settings=SETTINGS, transport=transport)
+        events: list[dict] = []
+        try:
+            async for event in client.subscribe_to_run("run-123"):
+                events.append(event)
+        except AgentConnectionError:
+            return events
+        raise AssertionError("expected AgentConnectionError")
+
+    events = asyncio.run(scenario())
+    assert events == [{"event": "in_progress", "data": {"run_id": "run-123"}}]
+    assert len(transport.requests) == 1
+    assert transport.requests[0].method == "GET"
     assert transport.closed is True
 
 

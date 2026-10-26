@@ -68,11 +68,17 @@ class AgentClient:
     async def subscribe_to_run(self, agent_run_id: str) -> AsyncIterator[dict[str, Any]]:
         """Yield SSE events from one GET of the run stream.
 
-        The connection closes after a terminal ``completed`` or ``failed``
-        event. No further requests are made.
+        The connection closes after the first terminal ``completed`` or
+        ``failed`` event. No further requests are made.
+
+        If the agent disconnects before that terminal event — including a
+        drop while the stream is still ``in_progress`` — this raises
+        ``AgentConnectionError``. That failure is not retried and does not
+        open another subscription (HLD Risk 3).
         """
         run_id = quote(agent_run_id, safe="")
         url = f"{self._base_url}/agent/runs/{run_id}/events"
+        saw_terminal = False
         try:
             async with self._open(SSE_TIMEOUT_SECONDS) as client:
                 async with client.stream(
@@ -85,8 +91,13 @@ class AgentClient:
                     async for event in _parse_sse(response):
                         yield event
                         if event["event"] in _TERMINAL_EVENTS:
+                            saw_terminal = True
                             break
+            if not saw_terminal:
+                raise AgentConnectionError("agent disconnected before a terminal event")
         except AgentHTTPError:
+            raise
+        except AgentConnectionError:
             raise
         except httpx.TimeoutException as exc:
             raise AgentTimeoutError("agent event stream timed out") from exc
