@@ -1,15 +1,20 @@
-"""POST /query: forward a query and return the agent's immediate reply.
+"""Query routes.
 
-The agent owns timing and status. This handler generates a client `run_id`,
-submits the query once, and registers `run_id` → `agent_run_id` after the
-agent replies. It does not wait for completion, poll, or create run status.
+POST /query forwards a query and returns the agent's immediate reply. It
+generates a client `run_id`, submits the query once, and registers
+`run_id` → `agent_run_id`. GET /query/{run_id}/stream subscribes once to that
+agent run and forwards events unchanged. The agent owns timing and status.
+These handlers do not poll or delay. A `failed` event is sent only when the
+agent subscription times out or fails.
 """
 
 from __future__ import annotations
 
+import json
 import logging
 import uuid
-from typing import Literal
+from collections.abc import AsyncIterator
+from typing import Any, Literal
 
 from fastapi import APIRouter, Depends, HTTPException
 
@@ -22,6 +27,7 @@ from app.services.agent_client import (
     AgentTimeoutError,
 )
 from app.services.run_registry import RunRegistry, get_run_registry
+from app.streaming import SSEResponse
 
 logger = logging.getLogger(__name__)
 
@@ -29,8 +35,12 @@ router = APIRouter()
 
 AGENT_UNAVAILABLE = "Agent service unavailable"
 INTERNAL_ERROR = "Internal server error"
+RUN_NOT_FOUND = "Run not found"
+AGENT_TIMEOUT = "Agent timeout"
+STREAM_ERROR = "Stream error"
 
 _AGENT_FAILURES = (AgentTimeoutError, AgentConnectionError, AgentHTTPError)
+_TERMINAL_EVENTS = frozenset({"completed", "failed"})
 
 
 @router.post("/query", response_model=ImmediateResponse, status_code=200)
@@ -73,3 +83,54 @@ def _require_agent_reply(payload: object) -> tuple[Literal["ok", "rejected"], st
     if reply_status == "ok":
         return "ok", agent_run_id
     return "rejected", agent_run_id
+
+
+@router.get("/query/{run_id}/stream")
+async def stream_status(
+    run_id: str,
+    agent_client: AgentClient = Depends(get_agent_client),
+    registry: RunRegistry = Depends(get_run_registry),
+) -> SSEResponse:
+    """Forward one agent event stream, then drop the run mapping.
+
+    Missing runs are 404. After the stream is open, a subscription timeout or
+    any other subscription error is a `failed` event on the open stream.
+    """
+    try:
+        agent_run_id = registry.lookup(run_id)
+    except KeyError:
+        raise HTTPException(status_code=404, detail=RUN_NOT_FOUND) from None
+
+    return SSEResponse(_forward_events(run_id, agent_run_id, agent_client, registry))
+
+
+async def _forward_events(
+    run_id: str,
+    agent_run_id: str,
+    agent_client: AgentClient,
+    registry: RunRegistry,
+) -> AsyncIterator[str]:
+    """Yield agent SSE frames unchanged. Always remove the run mapping."""
+    try:
+        async for agent_event in agent_client.subscribe_to_run(agent_run_id):
+            event_type = agent_event["event"]
+            event_data = agent_event["data"]
+            yield _sse_frame(event_type, event_data)
+            if event_type in _TERMINAL_EVENTS:
+                break
+    except TimeoutError:
+        logger.exception("agent subscription timed out")
+        yield _sse_frame("failed", {"run_id": run_id, "error": AGENT_TIMEOUT})
+    except Exception:
+        logger.exception("agent subscription failed")
+        yield _sse_frame("failed", {"run_id": run_id, "error": STREAM_ERROR})
+    finally:
+        try:
+            registry.remove(run_id)
+        except KeyError:
+            pass
+
+
+def _sse_frame(event_type: str, data: Any) -> str:
+    """Serialize one SSE event exactly as `event` plus a JSON `data` line."""
+    return f"event: {event_type}\ndata: {json.dumps(data)}\n\n"
