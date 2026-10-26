@@ -91,10 +91,11 @@ async def stream_status(
     agent_client: AgentClient = Depends(get_agent_client),
     registry: RunRegistry = Depends(get_run_registry),
 ) -> SSEResponse:
-    """Forward one agent event stream, then drop the run mapping.
+    """Forward one agent event stream, then drop the local run mapping.
 
     Missing runs are 404. After the stream is open, a subscription timeout or
-    any other subscription error is a `failed` event on the open stream.
+    a drop during a non-terminal event is a backend-generated `failed` event.
+    That recovery is not an agent-forwarded status and is not retried.
     """
     try:
         agent_run_id = registry.lookup(run_id)
@@ -121,12 +122,21 @@ async def _forward_events(
             event_type = agent_event["event"]
             event_data = agent_event["data"]
             yield _sse_frame(event_type, event_data)
+            # AD-4: the first completed or failed event closes the stream.
+            # Anything the agent sends after that, including a second terminal
+            # event, is left unread.
             if event_type in _TERMINAL_EVENTS:
                 break
     except TimeoutError:
+        # Backend-generated exception event. AC3 still forbids inventing
+        # status on the normal path; this runs only when the subscription
+        # times out (HLD Risk 3), and it is not an event the agent sent.
         logger.exception("agent subscription timed out")
         yield _sse_frame("failed", {"run_id": run_id, "error": AGENT_TIMEOUT})
     except Exception:
+        # Backend-generated exception event for a failed subscription,
+        # including a disconnect while the run is still in_progress.
+        # One shot: the subscription is not retried (HLD Risk 3).
         logger.exception("agent subscription failed")
         yield _sse_frame("failed", {"run_id": run_id, "error": STREAM_ERROR})
     finally:

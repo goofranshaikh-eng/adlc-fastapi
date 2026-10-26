@@ -7,9 +7,11 @@ from collections.abc import AsyncIterator, Iterator
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
+import httpx
 import pytest
 from fastapi.testclient import TestClient
 
+from app.config import AgentSettings
 from app.dependencies import get_agent_client
 from app.main import app
 from app.services.agent_client import (
@@ -259,6 +261,12 @@ def test_subscription_error_sends_generic_failed_event(
     caplog: pytest.LogCaptureFixture,
     error: Exception,
 ) -> None:
+    """Connection and HTTP failures are one backend `failed` event, not a retry.
+
+    The agent already sent ``in_progress``. The ``failed`` frame is created
+    here as exception recovery. It is not an event the agent yielded, and
+    the endpoint does not open a second subscription.
+    """
     test_client, agent = client
     caplog.set_level("ERROR")
     response, _elapsed = _open(test_client, agent, [IN_PROGRESS], error=error)
@@ -269,7 +277,58 @@ def test_subscription_error_sends_generic_failed_event(
     ]
     assert str(error) not in response.text
     assert str(error) in caplog.text
+    assert agent.subscribed == [AGENT_RUN_ID]
+    assert agent.closed is True
     registry.remove.assert_called_once_with(RUN_ID)
+
+
+def test_agent_disconnect_during_in_progress_sends_stream_error_without_retry(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A stream that ends during in_progress is an error, not a silent retry.
+
+    HLD Risk 3: the agent connection closes before a terminal event. The
+    endpoint emits one backend-generated ``failed`` event ("Stream error")
+    and the client makes no further HTTP call.
+    """
+    caplog.set_level("ERROR")
+    requests: list[httpx.Request] = []
+    body = (
+        "event: in_progress\n"
+        f'data: {{"run_id": "{RUN_ID}"}}\n'
+        "\n"
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(200, text=body)
+
+    agent = AgentClient(
+        settings=AgentSettings(AGENT_BASE_URL="http://agent.test", AGENT_TIMEOUT=3),
+        transport=httpx.MockTransport(handler),
+    )
+    registry = RunRegistry()
+    registry.register(run_id=RUN_ID, agent_run_id=AGENT_RUN_ID)
+    app.dependency_overrides[get_agent_client] = lambda: agent
+    app.dependency_overrides[get_run_registry] = lambda: registry
+    try:
+        with TestClient(app) as test_client:
+            response = test_client.get(f"/query/{RUN_ID}/stream")
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    assert parse_sse(response.text) == [
+        IN_PROGRESS,
+        {"event": "failed", "data": {"run_id": RUN_ID, "error": "Stream error"}},
+    ]
+    assert "agent disconnected before a terminal event" not in response.text
+    assert "agent disconnected before a terminal event" in caplog.text
+    assert len(requests) == 1
+    assert requests[0].method == "GET"
+    assert requests[0].url.path == f"/agent/runs/{AGENT_RUN_ID}/events"
+    with pytest.raises(RunNotFoundError):
+        registry.lookup(RUN_ID)
 
 
 def test_client_disconnection_triggers_cleanup(registry: MagicMock) -> None:
